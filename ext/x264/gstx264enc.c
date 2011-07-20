@@ -97,6 +97,7 @@
 #include "gstx264enc.h"
 
 #include <gst/pbutils/pbutils.h>
+#include <gst/video/video.h>
 
 #if X264_BUILD >= 71
 #define X264_DELAYED_FRAMES_API
@@ -885,6 +886,8 @@ gst_x264_enc_init (GstX264Enc * encoder, GstX264EncClass * klass)
   gst_pad_set_event_function (encoder->srcpad,
       GST_DEBUG_FUNCPTR (gst_x264_enc_src_event));
 
+  gst_segment_init (&encoder->segment, GST_FORMAT_TIME);
+
   /* properties */
   encoder->threads = ARG_THREADS_DEFAULT;
   encoder->sliced_threads = ARG_SLICED_THREADS_DEFAULT;
@@ -938,6 +941,8 @@ gst_x264_enc_init (GstX264Enc * encoder, GstX264EncClass * klass)
   encoder->x264param.p_log_private = encoder;
   encoder->x264param.i_log_level = X264_LOG_DEBUG;
 
+  encoder->force_key_unit_event = NULL;
+
   gst_x264_enc_reset (encoder);
 }
 
@@ -948,12 +953,12 @@ gst_x264_enc_reset (GstX264Enc * encoder)
   encoder->width = 0;
   encoder->height = 0;
   encoder->current_byte_stream = GST_X264_ENC_STREAM_FORMAT_FROM_PROPERTY;
+  gst_segment_init (&encoder->segment, GST_FORMAT_UNDEFINED);
 
   GST_OBJECT_LOCK (encoder);
   encoder->i_type = X264_TYPE_AUTO;
-  if (encoder->forcekeyunit_event)
-    gst_event_unref (encoder->forcekeyunit_event);
-  encoder->forcekeyunit_event = NULL;
+  gst_event_replace (&encoder->force_key_unit_event, NULL);
+  encoder->pending_key_unit_ts = GST_CLOCK_TIME_NONE;
   GST_OBJECT_UNLOCK (encoder);
 }
 
@@ -1745,25 +1750,31 @@ gst_x264_enc_src_event (GstPad * pad, GstEvent * event)
 
   switch (GST_EVENT_TYPE (event)) {
     case GST_EVENT_CUSTOM_UPSTREAM:{
-      const GstStructure *s;
-      s = gst_event_get_structure (event);
-      if (gst_structure_has_name (s, "GstForceKeyUnit")) {
-        /* Set I frame request */
-        GST_OBJECT_LOCK (encoder);
-        encoder->i_type = X264_TYPE_I;
-        encoder->forcekeyunit_event = gst_event_copy (event);
-        GST_EVENT_TYPE (encoder->forcekeyunit_event) =
-            GST_EVENT_CUSTOM_DOWNSTREAM;
-        GST_OBJECT_UNLOCK (encoder);
-        forward = FALSE;
-        gst_event_unref (event);
-      }
+      guint count;
+      gboolean all_headers;
+
+      if (!gst_video_event_is_force_key_unit (event))
+        goto out;
+
+      GST_OBJECT_LOCK (encoder);
+      gst_video_event_parse_upstream_force_key_unit (event,
+          &encoder->pending_key_unit_ts, &all_headers, &count);
+      GST_INFO_OBJECT (encoder, "received upstream force-key-unit event, "
+          "seqnum %d running_time %" GST_TIME_FORMAT " all_headers %d count %d",
+          gst_event_get_seqnum (event),
+          GST_TIME_ARGS (encoder->pending_key_unit_ts), all_headers, count);
+
+      gst_event_replace (&encoder->force_key_unit_event, event);
+      gst_event_unref (event);
+      GST_OBJECT_UNLOCK (encoder);
+      forward = FALSE;
       break;
     }
     default:
       break;
   }
 
+out:
   if (forward)
     ret = gst_pad_push_event (encoder->sinkpad, event);
 
@@ -1780,6 +1791,24 @@ gst_x264_enc_sink_event (GstPad * pad, GstEvent * event)
   encoder = GST_X264_ENC (gst_pad_get_parent (pad));
 
   switch (GST_EVENT_TYPE (event)) {
+    case GST_EVENT_NEWSEGMENT:
+    {
+      gboolean update;
+      gdouble rate, applied_rate;
+      GstFormat format;
+      gint64 start, stop, position;
+
+      gst_event_parse_new_segment_full (event, &update, &rate, &applied_rate,
+          &format, &start, &stop, &position);
+      gst_segment_set_newsegment (&encoder->segment, update, rate, format,
+          start, stop, position);
+      break;
+    }
+    case GST_EVENT_FLUSH_START:
+      break;
+    case GST_EVENT_FLUSH_STOP:
+      gst_segment_init (&encoder->segment, GST_FORMAT_UNDEFINED);
+      break;
     case GST_EVENT_EOS:
       gst_x264_enc_flush_frames (encoder, TRUE);
       break;
@@ -1801,18 +1830,30 @@ gst_x264_enc_sink_event (GstPad * pad, GstEvent * event)
        * buffers in encoder are considered (in the) past */
     }
     case GST_EVENT_CUSTOM_DOWNSTREAM:{
-      const GstStructure *s;
-      s = gst_event_get_structure (event);
-      if (gst_structure_has_name (s, "GstForceKeyUnit")) {
-        GST_OBJECT_LOCK (encoder);
-        encoder->i_type = X264_TYPE_I;
-        GST_OBJECT_UNLOCK (encoder);
-      }
+      guint count;
+      gboolean all_headers;
+
+      if (!gst_video_event_is_force_key_unit (event))
+        break;
+
+      GST_OBJECT_LOCK (encoder);
+
+      gst_video_event_parse_downstream_force_key_unit (event, NULL, NULL,
+          &encoder->pending_key_unit_ts, &all_headers, &count);
+      GST_INFO_OBJECT (encoder, "received downstream force-key-unit event, "
+          "seqnum %d running_time %" GST_TIME_FORMAT " all_headers %d count %d",
+          gst_event_get_seqnum (event),
+          GST_TIME_ARGS (encoder->pending_key_unit_ts), all_headers, count);
+
+      gst_event_replace (&encoder->force_key_unit_event, event);
+      gst_event_unref (event);
+      GST_OBJECT_UNLOCK (encoder);
       break;
     }
     default:
       break;
   }
+
 
   ret = gst_pad_push_event (encoder->srcpad, event);
 
@@ -1883,6 +1924,45 @@ wrong_buffer_size:
   }
 }
 
+static GstEvent *
+check_pending_key_unit_event (GstEvent * pending_event, GstSegment * segment,
+    GstClockTime timestamp, GstClockTime pending_key_unit_ts)
+{
+  GstClockTime running_time, stream_time;
+  gboolean all_headers;
+  guint count;
+  GstEvent *event = NULL;
+
+  g_return_val_if_fail (pending_event != NULL, NULL);
+  g_return_val_if_fail (segment != NULL, NULL);
+
+  if (pending_event == NULL || timestamp == GST_CLOCK_TIME_NONE)
+    goto out;
+
+  running_time = gst_segment_to_running_time (segment,
+      GST_FORMAT_TIME, timestamp);
+
+  GST_INFO ("now %" GST_TIME_FORMAT " wanted %" GST_TIME_FORMAT,
+      GST_TIME_ARGS (running_time), GST_TIME_ARGS (pending_key_unit_ts));
+
+  if (running_time < pending_key_unit_ts)
+    goto out;
+
+  stream_time = gst_segment_to_stream_time (segment,
+      GST_FORMAT_TIME, timestamp);
+
+  gst_video_event_parse_upstream_force_key_unit (pending_event,
+      NULL, &all_headers, &count);
+
+  event =
+      gst_video_event_new_downstream_force_key_unit (timestamp, stream_time,
+      running_time, all_headers, count);
+  gst_event_set_seqnum (event, gst_event_get_seqnum (pending_event));
+
+out:
+  return event;
+}
+
 static GstFlowReturn
 gst_x264_enc_encode_frame (GstX264Enc * encoder, x264_picture_t * pic_in,
     int *i_nal, gboolean send)
@@ -1899,7 +1979,7 @@ gst_x264_enc_encode_frame (GstX264Enc * encoder, x264_picture_t * pic_in,
   GstFlowReturn ret;
   GstClockTime duration;
   guint8 *data;
-  GstEvent *forcekeyunit_event = NULL;
+  GstEvent *event = NULL;
 
   if (G_UNLIKELY (encoder->x264enc == NULL))
     return GST_FLOW_NOT_NEGOTIATED;
@@ -1910,6 +1990,17 @@ gst_x264_enc_encode_frame (GstX264Enc * encoder, x264_picture_t * pic_in,
     if (x264_encoder_reconfig (encoder->x264enc, &encoder->x264param) < 0)
       GST_WARNING_OBJECT (encoder, "Could not reconfigure");
   }
+
+  if (encoder->pending_key_unit_ts != GST_CLOCK_TIME_NONE) {
+    event = check_pending_key_unit_event (encoder->force_key_unit_event,
+        &encoder->segment, pic_in->i_pts, encoder->pending_key_unit_ts);
+    if (event) {
+      encoder->pending_key_unit_ts = GST_CLOCK_TIME_NONE;
+      gst_event_replace (&encoder->force_key_unit_event, NULL);
+
+      x264_encoder_intra_refresh (encoder->x264enc);
+    }
+  }
   GST_OBJECT_UNLOCK (encoder);
 
   encoder_return = x264_encoder_encode (encoder->x264enc,
@@ -1918,11 +2009,13 @@ gst_x264_enc_encode_frame (GstX264Enc * encoder, x264_picture_t * pic_in,
   if (encoder_return < 0) {
     GST_ELEMENT_ERROR (encoder, STREAM, ENCODE, ("Encode x264 frame failed."),
         ("x264_encoder_encode return code=%d", encoder_return));
-    return GST_FLOW_ERROR;
+    ret = GST_FLOW_ERROR;
+    goto out;
   }
 
   if (!*i_nal) {
-    return GST_FLOW_OK;
+    ret = GST_FLOW_OK;
+    goto out;
   }
 #ifndef X264_ENC_NALS
   i_size = 0;
@@ -1959,16 +2052,19 @@ gst_x264_enc_encode_frame (GstX264Enc * encoder, x264_picture_t * pic_in,
   } else {
     GST_ELEMENT_ERROR (encoder, STREAM, ENCODE, (NULL),
         ("Timestamp queue empty."));
-    return GST_FLOW_ERROR;
+    ret = GST_FLOW_ERROR;
+    goto out;
   }
 
-  if (!send)
-    return GST_FLOW_OK;
+  if (!send) {
+    ret = GST_FLOW_OK;
+    goto out;
+  }
 
   ret = gst_pad_alloc_buffer (encoder->srcpad, GST_BUFFER_OFFSET_NONE,
       i_size, GST_PAD_CAPS (encoder->srcpad), &out_buf);
   if (ret != GST_FLOW_OK)
-    return ret;
+    goto out;
 
   memcpy (GST_BUFFER_DATA (out_buf), data, i_size);
   GST_BUFFER_SIZE (out_buf) = i_size;
@@ -1991,17 +2087,16 @@ gst_x264_enc_encode_frame (GstX264Enc * encoder, x264_picture_t * pic_in,
     GST_BUFFER_FLAG_SET (out_buf, GST_BUFFER_FLAG_DELTA_UNIT);
   }
 
-  GST_OBJECT_LOCK (encoder);
-  forcekeyunit_event = encoder->forcekeyunit_event;
-  encoder->forcekeyunit_event = NULL;
-  GST_OBJECT_UNLOCK (encoder);
-  if (forcekeyunit_event) {
-    gst_structure_set (forcekeyunit_event->structure,
-        "timestamp", G_TYPE_UINT64, GST_BUFFER_TIMESTAMP (out_buf), NULL);
-    gst_pad_push_event (encoder->srcpad, forcekeyunit_event);
-  }
+  if (event)
+    gst_pad_push_event (encoder->srcpad, gst_event_ref (event));
 
-  return gst_pad_push (encoder->srcpad, out_buf);
+  ret = gst_pad_push (encoder->srcpad, out_buf);
+
+out:
+  if (event)
+    gst_event_unref (event);
+
+  return ret;
 }
 
 static void
